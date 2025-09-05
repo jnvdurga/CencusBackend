@@ -16,7 +16,11 @@ const PORT = 3000;
 
 app.use(
   cors({
-    origin: ["http://localhost:5173", "http://localhost:3000"], // add allowed origins
+    origin: [
+      "http://localhost:5173",
+      "http://localhost:3000",
+      "https://census-frontend-ttbh-git-main-jnvdurgas-projects.vercel.app" // <-- Vercel frontend
+    ],
     methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     credentials: true,
   })
