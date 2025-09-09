@@ -4,6 +4,7 @@ import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
 import gdal from "gdal-async";
+import compression from "compression";
 
 // ------------------ Fix __dirname ------------------ //
 const __filename = fileURLToPath(import.meta.url);
@@ -12,7 +13,7 @@ const __dirname = path.dirname(__filename);
 const app = express();
 const PORT = 3000;
 
-// Enable CORS with specific origins
+// Enable CORS
 app.use(
   cors({
     origin: [
@@ -25,79 +26,91 @@ app.use(
   })
 );
 
+// Enable gzip compression
+app.use(compression());
+
 app.use(express.json());
 
-// ------------------ Helper function to read features from layer ------------------ //
+// ------------------ Cache ------------------ //
+const cache = {
+  departments: null,
+  municipalities: new Map(),
+  lastUpdated: null,
+};
+const CACHE_EXPIRY = 5 * 60 * 1000; // 5 minutes
+
+// ------------------ Helper: Read features ------------------ //
 function readFeaturesFromLayer(layer) {
   const features = [];
-  layer.features.forEach((feature) => {
+  let feature;
+  const iterator = layer.features;
+  while ((feature = iterator.next())) {
     features.push({
       type: "Feature",
       properties: feature.fields.toObject(),
       geometry: JSON.parse(feature.getGeometry().toJSON()),
     });
-  });
+  }
   return features;
 }
 
 // ------------------ Preload Departments ------------------ //
 const departmentFile = path.join(__dirname, "./department.gpkg");
-let departmentsGeoJSON = null;
+let departmentDb;
 
 try {
-  const departmentDb = gdal.open(departmentFile);
+  departmentDb = gdal.open(departmentFile);
   const deptLayer = departmentDb.layers.get(0);
   const features = readFeaturesFromLayer(deptLayer);
-  departmentsGeoJSON = { type: "FeatureCollection", features };
+  cache.departments = { type: "FeatureCollection", features };
+  cache.lastUpdated = Date.now();
   console.log("✅ Departments preloaded");
   departmentDb.close();
 } catch (err) {
   console.error("❌ Failed to load Department.gpkg:", err);
 }
 
-// ------------------ Preload Municipalities ------------------ //
-const municipalityCache = new Map();
-const dataDir = path.join(__dirname, "data");
-
-fs.readdirSync(dataDir).forEach(file => {
-  if (file.endsWith(".gpkg")) {
-    const departmentCode = file.match(/\d+/)[0]; // extract code from filename
-    try {
-      const muniDb = gdal.open(path.join(dataDir, file));
-      const layer = muniDb.layers.get(0);
-      const features = readFeaturesFromLayer(layer);
-      municipalityCache.set(departmentCode, { type: "FeatureCollection", features });
-      console.log(`✅ Preloaded municipalities for department ${departmentCode}`);
-      muniDb.close();
-    } catch (err) {
-      console.error(`❌ Failed to preload ${file}:`, err);
-    }
-  }
-});
-
-// ------------------ Departments Endpoint ------------------ //
+// ------------------ Departments endpoint ------------------ //
 app.get("/api/departments", (req, res) => {
-  if (!departmentsGeoJSON) {
-    return res.status(500).json({ error: "Departments data not available" });
-  }
-  res.json(departmentsGeoJSON);
+  if (!cache.departments) return res.status(500).json({ error: "Departments data not available" });
+  res.json(cache.departments);
 });
 
-// ------------------ Municipalities Endpoint ------------------ //
+// ------------------ Municipalities endpoint (lazy loading + memory cache) ------------------ //
 app.get("/api/municipalities/:departmentCode", (req, res) => {
   const { departmentCode } = req.params;
-  const data = municipalityCache.get(departmentCode);
-  if (data) {
-    return res.json(data);
-  } else {
-    return res.status(404).json({ error: "Municipality data not found" });
+
+  // Serve from cache if available and valid
+  const cached = cache.municipalities.get(departmentCode);
+  if (cached && Date.now() - cached.timestamp < CACHE_EXPIRY) {
+    return res.json(cached.data);
+  }
+
+  // Lazy load GPKG
+  try {
+    const muniFile = path.join(__dirname, "data", `DPTO_CCDGO_${departmentCode}.gpkg`);
+    if (!fs.existsSync(muniFile)) return res.status(404).json({ error: "Municipality data not found" });
+
+    const muniDb = gdal.open(muniFile);
+    const layer = muniDb.layers.get(0);
+    const features = readFeaturesFromLayer(layer);
+    muniDb.close();
+
+    const geojson = { type: "FeatureCollection", features };
+    cache.municipalities.set(departmentCode, { data: geojson, timestamp: Date.now() });
+
+    res.json(geojson);
+  } catch (err) {
+    console.error("❌ Municipality error:", err);
+    res.status(500).json({ error: "Failed to read municipality data", details: err.message });
   }
 });
 
-// ------------------ Clear Cache Endpoint (for development) ------------------ //
+// ------------------ Clear cache ------------------ //
 app.delete("/api/cache", (req, res) => {
-  departmentsGeoJSON = null;
-  municipalityCache.clear();
+  cache.departments = null;
+  cache.municipalities.clear();
+  cache.lastUpdated = null;
   res.json({ message: "Cache cleared" });
 });
 
@@ -105,6 +118,6 @@ app.delete("/api/cache", (req, res) => {
 app.listen(PORT, () => {
   console.log(`🚀 Server running on http://localhost:${PORT}`);
   console.log(`📍 Departments: http://localhost:${PORT}/api/departments`);
-  console.log(`📍 Municipalities (example): http://localhost:${PORT}/api/municipalities/05`);
+  console.log(`📍 Municipalities example: http://localhost:${PORT}/api/municipalities/05`);
   console.log(`📍 Clear cache: http://localhost:${PORT}/api/cache`);
 });
